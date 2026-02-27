@@ -1,5 +1,9 @@
 """
 Email Reporter for Form 4 Scanner
+
+Phase 4 Update: Cluster alert emails now include options volume
+contamination warnings when detected. Warning HTML is generated
+by options_volume_check.py and attached to each alert dict.
 """
 import smtplib
 from email.mime.text import MIMEText
@@ -16,6 +20,14 @@ class EmailReporter:
         if not alerts:
             return False
         subject = f"Insider Buying Clusters: {len(alerts)} stocks detected"
+        
+        # Check if any alerts are contaminated — upgrade subject line
+        contaminated = [a for a in alerts
+                        if a.get('options_contamination', {}).get('contaminated')]
+        if contaminated:
+            subject = (f"Insider Buying Clusters: {len(alerts)} stocks "
+                       f"({len(contaminated)} ⚠️ options-contaminated)")
+        
         html_content = self._build_cluster_html(alerts)
         text_content = self._build_cluster_text(alerts)
         if dry_run:
@@ -25,7 +37,7 @@ class EmailReporter:
         return self._send_email(subject, html_content, text_content)
     
     # ============================================================
-    #  SELL ALERT EMAIL (NEW — backtest-validated)
+    #  SELL ALERT EMAIL (backtest-validated)
     # ============================================================
     
     def send_sell_alert(self, alerts, dry_run=False):
@@ -293,7 +305,7 @@ class EmailReporter:
         return "\n".join(lines)
     
     # ============================================================
-    #  EXISTING METHODS (unchanged)
+    #  CLUSTER ALERT (with Phase 4 contamination warnings)
     # ============================================================
     
     def send_status_report(self, stats, message="", dry_run=False):
@@ -409,12 +421,22 @@ class EmailReporter:
         return "\n".join(lines)
     
     def _build_cluster_html(self, alerts):
-        """Build styled HTML for cluster alerts."""
+        """
+        Build styled HTML for cluster alerts.
+        
+        Phase 4 Update: Each alert may contain an 'options_contamination'
+        dict. If present and contaminated, a warning banner is rendered
+        between the cluster stats and the transaction list.
+        """
         now = datetime.now()
         
         # Calculate totals
         total_insiders = sum(a.get('unique_insiders', 0) for a in alerts)
         total_dollars = sum(a.get('total_purchased', 0) for a in alerts)
+        contaminated_count = sum(
+            1 for a in alerts
+            if a.get('options_contamination', {}).get('contaminated')
+        )
         
         html = f'''
         <!DOCTYPE html>
@@ -430,8 +452,10 @@ class EmailReporter:
                 .stat-box {{ background: white; border-radius: 8px; padding: 20px; text-align: center; flex: 1; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
                 .stat-box .number {{ font-size: 32px; font-weight: bold; color: #276749; }}
                 .stat-box .label {{ font-size: 12px; color: #718096; text-transform: uppercase; margin-top: 5px; }}
+                .stat-box.warn .number {{ color: #c53030; }}
                 .cluster-card {{ background: white; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); overflow: hidden; }}
                 .cluster-header {{ background: #276749; color: white; padding: 15px 20px; }}
+                .cluster-header.contaminated {{ background: linear-gradient(135deg, #276749 0%, #744210 100%); }}
                 .cluster-header .ticker {{ font-size: 24px; font-weight: bold; }}
                 .cluster-header .company {{ font-size: 14px; opacity: 0.9; margin-top: 3px; }}
                 .cluster-body {{ padding: 20px; }}
@@ -470,6 +494,18 @@ class EmailReporter:
                         <div class="number">${total_dollars/1000000:.1f}M</div>
                         <div class="label">Total Purchased</div>
                     </div>
+        '''
+        
+        # Show contamination count if any found
+        if contaminated_count > 0:
+            html += f'''
+                    <div class="stat-box warn">
+                        <div class="number">{contaminated_count}</div>
+                        <div class="label">⚠️ Options Contaminated</div>
+                    </div>
+            '''
+        
+        html += '''
                 </div>
         '''
         
@@ -481,6 +517,7 @@ class EmailReporter:
             first_date = alert.get('first_purchase', 'N/A')
             last_date = alert.get('last_purchase', 'N/A')
             transactions = alert.get('transactions', [])
+            contam = alert.get('options_contamination', {})
             
             # Format total purchased
             if total_purchased >= 1000000:
@@ -488,9 +525,12 @@ class EmailReporter:
             else:
                 purchased_display = f"${total_purchased:,.0f}"
             
+            # Header class — orange gradient if contaminated
+            header_class = 'contaminated' if contam.get('contaminated') else ''
+            
             html += f'''
                 <div class="cluster-card">
-                    <div class="cluster-header">
+                    <div class="cluster-header {header_class}">
                         <div class="ticker">#{i}: {ticker}</div>
                         <div class="company">{company}</div>
                     </div>
@@ -509,7 +549,46 @@ class EmailReporter:
                                 <div class="label">Date Range</div>
                             </div>
                         </div>
-                        
+            '''
+            
+            # ── Phase 4: Options Volume Contamination Warning ──
+            if contam.get('contaminated'):
+                warning_html = contam.get('warning_html', '')
+                if warning_html:
+                    html += warning_html
+                else:
+                    # Fallback if warning_html wasn't generated
+                    max_dev = contam.get('max_deviation', 0)
+                    n_anom = len(contam.get('anomalies', []))
+                    html += f'''
+                        <div style="background:#fff5f5; border-left:4px solid #c53030;
+                                    padding:10px 14px; margin:8px 0; border-radius:0 6px 6px 0;
+                                    font-size:12px;">
+                            <div style="font-weight:bold; color:#c53030; margin-bottom:3px;">
+                                ⚠️ OPTIONS VOLUME CONTAMINATION
+                            </div>
+                            <div style="color:#555;">
+                                {n_anom} unusual options volume event{'s' if n_anom != 1 else ''}
+                                detected within ±20 trading days ({max_dev:.1f}x deviation).
+                            </div>
+                            <div style="color:#888; margin-top:4px; font-size:11px;">
+                                Phase 4: insider+options = -11.83% alpha at 20d vs +0.99% clean.
+                                Consider downgrading conviction.
+                            </div>
+                        </div>
+                    '''
+            elif contam.get('error'):
+                # Note that check was attempted but failed
+                html += f'''
+                    <div style="background:#f5f5f5; border-left:4px solid #bbb;
+                                padding:6px 12px; margin:6px 0; border-radius:0 4px 4px 0;
+                                font-size:11px; color:#999;">
+                        ⚪ Options volume check unavailable: {contam['error']}
+                    </div>
+                '''
+            # If no contamination data at all, show nothing (clean)
+            
+            html += '''
                         <div class="transactions-title">Transactions:</div>
             '''
             
@@ -544,6 +623,7 @@ class EmailReporter:
             
             <div class="footer">
                 <p>Form 4 Insider Buying Scanner | Generated: {now.strftime('%Y-%m-%d %H:%M:%S')}</p>
+                <p style="font-size:11px; color:#bbb;">Options contamination filter powered by Phase 4 cross-signal backtest (2021-2026)</p>
             </div>
         </body>
         </html>
@@ -551,13 +631,26 @@ class EmailReporter:
         return html
     
     def _build_cluster_text(self, alerts):
-        """Build plain text cluster alert."""
+        """Build plain text cluster alert with contamination warnings."""
         lines = [f"INSIDER BUYING CLUSTERS - {len(alerts)} stocks", "=" * 50]
         for i, alert in enumerate(alerts, 1):
-            lines.append(f"\n#{i}: {alert['ticker']} - {alert['company_name']}")
+            contam = alert.get('options_contamination', {})
+            contam_tag = " ⚠️ OPTIONS CONTAMINATED" if contam.get('contaminated') else ""
+            
+            lines.append(f"\n#{i}: {alert['ticker']} - {alert['company_name']}{contam_tag}")
             lines.append(f"Unique Insiders: {alert['unique_insiders']}")
             lines.append(f"Total Purchased: ${alert['total_purchased']:,.0f}")
             lines.append(f"Date Range: {alert.get('first_purchase', 'N/A')} to {alert.get('last_purchase', 'N/A')}")
+            
+            if contam.get('contaminated'):
+                warning = contam.get('warning_text', '')
+                if warning:
+                    lines.append(warning)
+                else:
+                    lines.append(f"  ⚠️ Options volume spike: {contam.get('max_deviation', 0):.1f}x deviation, "
+                                 f"{len(contam.get('anomalies', []))} events")
+                    lines.append(f"  Phase 4: insider+options = -11.83% alpha vs +0.99% clean")
+            
             lines.append("Transactions:")
             for txn in alert.get('transactions', [])[:5]:
                 name = txn.get('insider_name', 'Unknown')

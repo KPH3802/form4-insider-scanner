@@ -6,8 +6,14 @@ This script orchestrates the entire workflow:
 1. Fetch recent Form 4 filings from SEC EDGAR
 2. Parse and store transaction data
 3. Analyze for insider buying clusters
-4. Analyze for insider sell signals (backtest-validated)
-5. Send email alerts (or daily status if no clusters/sells)
+4. Check options volume contamination (Phase 4 cross-signal filter)
+5. Analyze for insider sell signals (backtest-validated)
+6. Send email alerts (or daily status if no clusters/sells)
+
+Phase 4 Result: Options volume is a kill switch for insider signals.
+  Insider + options spike (±20d): -11.83% alpha at 20d, 16.7% win rate
+  Call-heavy + insider: -13.86% at 20d, 5.9% win rate
+  Clean insider clusters: +0.99% at 20d (significant)
 
 Usage:
     python main.py                # Run full scan
@@ -36,6 +42,14 @@ from edgar_fetcher import EdgarFetcher
 from form4_parser import Form4Parser
 from analyzer import ClusterAnalyzer, SellSignalAnalyzer
 from email_reporter import EmailReporter
+
+# Phase 4 cross-signal filter — graceful fallback if module/DB unavailable
+try:
+    from options_volume_check import check_options_contamination
+    OPTIONS_CHECK_AVAILABLE = True
+except ImportError:
+    OPTIONS_CHECK_AVAILABLE = False
+    print("NOTE: options_volume_check not available — contamination filter disabled")
 
 
 def fetch_and_store_filings():
@@ -91,8 +105,65 @@ def fetch_and_store_filings():
     return filings_processed, transactions_added, errors
 
 
+# ============================================================
+#  PHASE 4: OPTIONS VOLUME CONTAMINATION CHECK
+# ============================================================
+
+def check_cluster_contamination(clusters):
+    """
+    Check each insider buying cluster for concurrent options volume spikes.
+    
+    Phase 4 Backtest (2021-2026, ±20d window):
+      - Insider + options spike: -11.83% alpha at 20d, 16.7% win rate
+      - Clean insider clusters: +0.99% alpha at 20d
+      - Call-heavy + insider: -13.86% at 20d, 5.9% win rate (nuclear)
+      - Options spike first → insider buys: -13.15% at 20d, 8.0% win rate
+    
+    Attaches 'options_contamination' dict to each cluster for email rendering.
+    """
+    if not OPTIONS_CHECK_AVAILABLE:
+        print("  Options contamination check: SKIPPED (module not available)")
+        return
+
+    print("Checking options volume contamination (Phase 4 filter)...")
+    contaminated_count = 0
+    clean_count = 0
+    error_count = 0
+
+    for cluster in clusters:
+        ticker = cluster['ticker']
+        # Use last purchase date as anchor for the ±20 trading day window
+        event_date = cluster.get('last_purchase') or datetime.now().strftime('%Y-%m-%d')
+
+        try:
+            result = check_options_contamination(ticker, event_date)
+            cluster['options_contamination'] = result
+
+            if result['contaminated']:
+                contaminated_count += 1
+                print(f"  ⚠️  {ticker}: CONTAMINATED ({result['max_deviation']:.1f}x, "
+                      f"{len(result['anomalies'])} event{'s' if len(result['anomalies']) != 1 else ''})")
+            elif result['error']:
+                error_count += 1
+                print(f"  ⚪ {ticker}: check skipped ({result['error']})")
+            else:
+                clean_count += 1
+                print(f"  ✅ {ticker}: clean")
+        except Exception as e:
+            error_count += 1
+            cluster['options_contamination'] = {
+                'contaminated': False, 'anomalies': [], 'max_deviation': 0,
+                'signal_types': [], 'warning_html': '', 'warning_text': '',
+                'error': str(e)
+            }
+            print(f"  ❌ {ticker}: ERROR - {e}")
+
+    print(f"  Summary: {contaminated_count} contaminated, {clean_count} clean, "
+          f"{error_count} errors/skipped")
+
+
 def analyze_and_alert(dry_run=False):
-    """Analyze for buying clusters and send alerts."""
+    """Analyze for buying clusters, check contamination, and send alerts."""
     analyzer = ClusterAnalyzer()
     reporter = EmailReporter()
     
@@ -114,14 +185,24 @@ def analyze_and_alert(dry_run=False):
         cluster['purchases'] = purchases
         new_clusters.append(cluster)
     
+    # Phase 4: Check options volume contamination on new clusters
+    if new_clusters:
+        check_cluster_contamination(new_clusters)
+    
     if new_clusters:
         if dry_run:
             for cluster in new_clusters:
-                print(f"  [DRY RUN] Would send BUY alert for {cluster['ticker']}: {cluster['unique_insiders']} insiders, ${cluster['total_purchased']:,.0f}")
+                contam = cluster.get('options_contamination', {})
+                tag = " ⚠️ CONTAMINATED" if contam.get('contaminated') else ""
+                print(f"  [DRY RUN] Would send BUY alert for "
+                      f"{cluster['ticker']}{tag}: "
+                      f"{cluster['unique_insiders']} insiders, "
+                      f"${cluster['total_purchased']:,.0f}")
         else:
             if reporter.send_cluster_alert(new_clusters):
                 for cluster in new_clusters:
-                    record_alert_sent('cluster', cluster['ticker'], today, f"{cluster['unique_insiders']} insiders")
+                    record_alert_sent('cluster', cluster['ticker'], today,
+                                      f"{cluster['unique_insiders']} insiders")
                 print(f"  Sent 1 email with {len(new_clusters)} buying clusters")
     
     return clusters, len(new_clusters)
@@ -145,7 +226,8 @@ def analyze_sells_and_alert(dry_run=False):
     s1_total = sum(1 for s in all_sells if s['tier_tag'] == 'S1')
     s2_total = sum(1 for s in all_sells if s['tier_tag'] == 'S2')
     watch_total = sum(1 for s in all_sells if s['tier_tag'] == 'SELL_WATCH')
-    print(f"  Found {len(all_sells)} tickers with significant sells: {s1_total} S1, {s2_total} S2, {watch_total} WATCH")
+    print(f"  Found {len(all_sells)} tickers with significant sells: "
+          f"{s1_total} S1, {s2_total} S2, {watch_total} WATCH")
     
     # Get only new (un-alerted) S1 and S2 signals
     new_alerts = sell_analyzer.get_new_sell_alerts()
@@ -166,7 +248,8 @@ def analyze_sells_and_alert(dry_run=False):
     return all_sells, len(new_alerts)
 
 
-def send_status_report(filings_processed, transactions_added, clusters_found, sells_found=None, dry_run=False):
+def send_status_report(filings_processed, transactions_added, clusters_found,
+                       sells_found=None, dry_run=False):
     """Send daily status email."""
     reporter = EmailReporter()
     stats = get_database_stats()
@@ -221,6 +304,8 @@ def main():
     print(f"  Purchases: {stats['total_purchases']}")
     print(f"  Sells: {stats.get('total_sells', 'N/A')}")
     print(f"  Companies: {stats['unique_companies']}")
+    print(f"  Options contamination filter: "
+          f"{'ENABLED' if OPTIONS_CHECK_AVAILABLE else 'DISABLED'}")
     
     filings_processed = 0
     transactions_added = 0
@@ -232,7 +317,7 @@ def main():
         print("\n" + "=" * 40)
         filings_processed, transactions_added, errors = fetch_and_store_filings()
     
-    # Analyze for buying clusters
+    # Analyze for buying clusters (now includes Phase 4 contamination check)
     if not fetch_only and not status_only:
         print("\n" + "=" * 40)
         clusters, buy_alerts_sent = analyze_and_alert(dry_run=dry_run)
@@ -246,7 +331,8 @@ def main():
     if not fetch_only and not analyze_only:
         print("\n" + "=" * 40)
         print("Sending daily status email...")
-        send_status_report(filings_processed, transactions_added, clusters, sells, dry_run=dry_run)
+        send_status_report(filings_processed, transactions_added, clusters,
+                           sells, dry_run=dry_run)
     
     print("\n" + "=" * 40)
     print("Scan complete!")

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Cross-Signal Scanner: Insider Buying × Short Interest
-=====================================================
+Cross-Signal Scanner: Insider Buying × Short Interest × Options Volume
+======================================================================
 Runs after the Form 4 scanner. Checks recent insider purchases for
 Tier2 quality (C-Suite + $500K+), then enriches with short interest
-data to identify the highest-conviction signals.
+data and checks for options volume contamination.
 
 Backtested edge (2020-2025):
   Tier2 + DTC>5 + SI Increasing >10%:
@@ -15,6 +15,12 @@ Backtested edge (2020-2025):
 
   Tier2 + DTC>5 (without SI filter):
     5d:  +4.67% alpha, 70.2% WR (n=527, p<0.0001)
+
+Phase 4 OPTIONS CONTAMINATION (2021-2026):
+  Insider + options spike (±20d): -11.83% alpha at 20d, 16.7% WR
+  Call-heavy + insider: -13.86% at 20d, 5.9% WR
+  Clean insider clusters: +0.99% at 20d
+  → Options volume is a KILL SWITCH for insider signals
 
 Scheduled: 22:15 UTC daily (after Form 4 scanner at 22:00 UTC)
 Command:  cd /home/KPH3802/form4_scanner && python3 cross_signal_scanner.py
@@ -37,6 +43,13 @@ try:
 except ImportError:
     # Fallback if config structure differs
     EMAIL_CONFIG = None
+
+# Phase 4 cross-signal filter
+try:
+    from options_volume_check import check_options_contamination
+    OPTIONS_CHECK_AVAILABLE = True
+except ImportError:
+    OPTIONS_CHECK_AVAILABLE = False
 
 # Database path (same as Form 4 scanner)
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -195,10 +208,6 @@ def fetch_short_interest(tickers):
 # ---------------------------------------------------------------------------
 # FRED MACRO REGIME: VIX, Yield Curve, Credit Spreads
 # ---------------------------------------------------------------------------
-# Thresholds from backtested FRED macro analysis (2006-2026):
-#   VIX >30:           Insider+SI alpha drops to +0.90% (NOT significant)
-#   T10Y2Y 0 to 0.5:   20d alpha goes negative (-0.26%)
-#   Credit spread >=4:  Alpha roughly halved (+1.76% vs +3.89%)
 MACRO_SERIES = {
     'vix':    'VIXCLS',
     'yc':     'T10Y2Y',
@@ -209,14 +218,6 @@ MACRO_SERIES = {
 def get_macro_regime():
     """
     Read latest VIX, yield curve, and credit spread from fred_economic.db.
-
-    Returns dict with:
-        'vix':    float or None
-        'yc':     float or None
-        'credit': float or None
-        'flags':  list of warning strings (empty = favorable)
-        'label':  str  ('FAVORABLE', 'CAUTION', 'UNFAVORABLE')
-        'error':  str or None  (if DB missing/unreadable)
     """
     result = {
         'vix': None, 'yc': None, 'credit': None,
@@ -246,23 +247,15 @@ def get_macro_regime():
 
         conn.close()
 
-        # --- Evaluate regime ---
         flags = []
-
-        # VIX >30 = extreme fear, insider edge disappears
         if result['vix'] is not None and result['vix'] > 30:
             flags.append(f"VIX={result['vix']:.1f} (>30: alpha NOT significant)")
-
-        # Flat yield curve = 20d alpha goes negative
         if result['yc'] is not None and 0 <= result['yc'] < 0.5:
             flags.append(f"Yield curve={result['yc']:.2f} (flat 0-0.5: 20d alpha negative)")
-
-        # Wide credit spreads = alpha halved
         if result['credit'] is not None and result['credit'] >= 4:
             flags.append(f"Credit spread={result['credit']:.2f} (>=4: alpha halved)")
 
         result['flags'] = flags
-
         if len(flags) >= 2:
             result['label'] = 'UNFAVORABLE'
         elif len(flags) == 1:
@@ -270,7 +263,6 @@ def get_macro_regime():
         else:
             result['label'] = 'FAVORABLE'
 
-        # Print summary
         print(f"  MACRO REGIME: {result['label']}")
         print(f"    VIX:     {result['vix']:.1f}" if result['vix'] else "    VIX:     N/A")
         print(f"    Yield:   {result['yc']:.2f}" if result['yc'] is not None else "    Yield:   N/A")
@@ -286,6 +278,56 @@ def get_macro_regime():
 
 
 # ---------------------------------------------------------------------------
+# PHASE 4: OPTIONS VOLUME CONTAMINATION CHECK
+# ---------------------------------------------------------------------------
+def check_signals_contamination(signals):
+    """
+    Check each Tier2 signal for options volume contamination.
+    
+    Phase 4 Backtest (2021-2026):
+      Insider + options spike (±20d): -11.83% alpha at 20d
+      Call-heavy + insider: -13.86% at 20d, 5.9% WR
+      Clean insider clusters: +0.99% at 20d
+    
+    Attaches 'options_contamination' dict to each signal.
+    """
+    if not OPTIONS_CHECK_AVAILABLE:
+        print("  Options contamination check: SKIPPED (module not available)")
+        return
+
+    print("\nChecking options volume contamination (Phase 4)...")
+    contaminated = 0
+    clean = 0
+    errors = 0
+
+    for signal in signals:
+        ticker = signal['ticker']
+        event_date = signal.get('transaction_date') or datetime.now().strftime('%Y-%m-%d')
+
+        try:
+            result = check_options_contamination(ticker, event_date)
+            signal['options_contamination'] = result
+
+            if result['contaminated']:
+                contaminated += 1
+                print(f"  ⚠️  {ticker}: CONTAMINATED ({result['max_deviation']:.1f}x, "
+                      f"{len(result['anomalies'])} events)")
+            elif result['error']:
+                errors += 1
+            else:
+                clean += 1
+        except Exception as e:
+            errors += 1
+            signal['options_contamination'] = {
+                'contaminated': False, 'anomalies': [], 'max_deviation': 0,
+                'signal_types': [], 'warning_html': '', 'warning_text': '',
+                'error': str(e)
+            }
+
+    print(f"  Summary: {contaminated} contaminated, {clean} clean, {errors} errors/skipped")
+
+
+# ---------------------------------------------------------------------------
 # SIGNAL CLASSIFICATION
 # ---------------------------------------------------------------------------
 def classify_signals(tier2_purchases, si_data, macro_regime=None):
@@ -293,12 +335,9 @@ def classify_signals(tier2_purchases, si_data, macro_regime=None):
     Combine Tier2 insider data with SI data.
     Classify each signal by strength tier.
     Attach macro regime context to each signal.
-
-    Returns list of enriched signal dicts sorted by tier (best first).
     """
     signals = []
 
-    # Default macro if not provided (graceful degradation)
     if macro_regime is None:
         macro_regime = {'label': 'UNKNOWN', 'flags': [], 'vix': None,
                         'yc': None, 'credit': None, 'error': 'Not fetched'}
@@ -308,7 +347,6 @@ def classify_signals(tier2_purchases, si_data, macro_regime=None):
         si = si_data.get(ticker, {})
 
         if si.get('error'):
-            # Still include but mark as unverified
             tier = 'UNVERIFIED'
             tier_num = 3
         else:
@@ -318,19 +356,15 @@ def classify_signals(tier2_purchases, si_data, macro_regime=None):
             if dtc > DTC_THRESHOLD and si_chg > SI_SURGE_THRESHOLD:
                 tier = '🔴 TIER 1 — HIGHEST CONVICTION'
                 tier_num = 0
-                # Backtest: +11.55% avg 5d alpha, 75% WR (small n=12)
             elif dtc > DTC_THRESHOLD and si_chg > SI_CHANGE_THRESHOLD:
                 tier = '🟠 TIER 2 — HIGH CONVICTION'
                 tier_num = 1
-                # Backtest: +6.73% avg 5d alpha, 69.7% WR (n=142)
             elif dtc > DTC_THRESHOLD:
                 tier = '🟡 TIER 3 — ELEVATED SHORT INTEREST'
                 tier_num = 2
-                # Backtest: +4.67% avg 5d alpha, 70.2% WR (n=527)
             else:
                 tier = '⚪ TIER 4 — TIER2 INSIDER BUY (no SI confirmation)'
                 tier_num = 4
-                # Backtest: +3.66% avg 5d alpha, 65.7% WR (n=1803)
 
         signal = {
             **p,
@@ -344,10 +378,10 @@ def classify_signals(tier2_purchases, si_data, macro_regime=None):
             'tier_num': tier_num,
             'macro_label': macro_regime['label'],
             'macro_flags': macro_regime['flags'],
+            'options_contamination': {},  # Populated later by check_signals_contamination
         }
         signals.append(signal)
 
-    # Sort: best tier first, then by total_value descending
     signals.sort(key=lambda x: (x['tier_num'], -x['total_value']))
     return signals
 
@@ -356,40 +390,45 @@ def classify_signals(tier2_purchases, si_data, macro_regime=None):
 # EMAIL ALERT
 # ---------------------------------------------------------------------------
 def build_email_html(signals, all_purchases_count, tier2_count, macro_regime=None):
-    """Build HTML email for cross-signal alerts with macro regime context."""
+    """Build HTML email for cross-signal alerts with macro regime and
+    options contamination context."""
 
     now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
-    # Separate signals with SI confirmation (Tier 1-3) from plain Tier2
     confirmed = [s for s in signals if s['tier_num'] <= 2]
     unconfirmed = [s for s in signals if s['tier_num'] >= 3]
+    contaminated = [s for s in signals
+                    if s.get('options_contamination', {}).get('contaminated')]
 
     if confirmed:
-        subject = f"🚨 CROSS-SIGNAL ALERT: {len(confirmed)} High-Conviction Insider Buy{'s' if len(confirmed)>1 else ''}"
+        subject = (f"🚨 CROSS-SIGNAL ALERT: {len(confirmed)} High-Conviction "
+                   f"Insider Buy{'s' if len(confirmed)>1 else ''}")
+        if contaminated:
+            subject += f" ({len(contaminated)} ⚠️ options-contaminated)"
         priority = "high"
     elif signals:
-        subject = f"📊 Insider Buy Alert: {len(signals)} Tier2 Signal{'s' if len(signals)>1 else ''} (no SI confirmation)"
+        subject = (f"📊 Insider Buy Alert: {len(signals)} Tier2 Signal"
+                   f"{'s' if len(signals)>1 else ''} (no SI confirmation)")
         priority = "normal"
     else:
         subject = f"📋 Cross-Signal Scanner: No Tier2 signals today"
         priority = "low"
 
-    # Build HTML
     html = f"""
     <html><body style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
 
     <h2 style="color: #1a1a2e; border-bottom: 3px solid #e94560; padding-bottom: 8px;">
         Cross-Signal Scanner Report
     </h2>
-    <p style="color: #666; font-size: 12px;">{now} | Purchases scanned: {all_purchases_count} | Tier2 matches: {tier2_count}</p>
+    <p style="color: #666; font-size: 12px;">{now} | Purchases scanned: {all_purchases_count} | Tier2 matches: {tier2_count} | Options check: {'ON' if OPTIONS_CHECK_AVAILABLE else 'OFF'}</p>
     """
 
     # --- Macro Regime Banner ---
     if macro_regime and not macro_regime.get('error'):
         macro_colors = {
-            'FAVORABLE':   ('#2e7d32', '#e8f5e9', '🟢'),  # Green
-            'CAUTION':     ('#f57f17', '#fff8e1', '🟡'),  # Yellow
-            'UNFAVORABLE': ('#c62828', '#ffebee', '🔴'),  # Red
+            'FAVORABLE':   ('#2e7d32', '#e8f5e9', '🟢'),
+            'CAUTION':     ('#f57f17', '#fff8e1', '🟡'),
+            'UNFAVORABLE': ('#c62828', '#ffebee', '🔴'),
         }
         m_border, m_bg, m_icon = macro_colors.get(
             macro_regime['label'], ('#757575', '#f5f5f5', '⚪'))
@@ -443,15 +482,15 @@ def build_email_html(signals, all_purchases_count, tier2_count, macro_regime=Non
         """.format(lookback=LOOKBACK_DAYS)
     else:
         for s in signals:
-            # Color based on tier
             tier_colors = {
-                0: ('#ff2d2d', '#fff5f5'),  # Red - highest
-                1: ('#ff8c00', '#fff8f0'),  # Orange - high
-                2: ('#ffd700', '#fffef0'),  # Yellow - elevated
-                3: ('#888', '#f8f8f8'),     # Gray - unverified
-                4: ('#ccc', '#fafafa'),     # Light gray - no SI
+                0: ('#ff2d2d', '#fff5f5'),
+                1: ('#ff8c00', '#fff8f0'),
+                2: ('#ffd700', '#fffef0'),
+                3: ('#888', '#f8f8f8'),
+                4: ('#ccc', '#fafafa'),
             }
             border_color, bg_color = tier_colors.get(s['tier_num'], ('#ccc', '#fafafa'))
+            contam = s.get('options_contamination', {})
 
             html += f"""
             <div style="background: {bg_color}; border-left: 4px solid {border_color};
@@ -514,6 +553,35 @@ def build_email_html(signals, all_purchases_count, tier2_count, macro_regime=Non
 
             html += """
                 </table>
+            """
+
+            # ── Phase 4: Options Contamination Warning ──
+            if contam.get('contaminated'):
+                warning_html = contam.get('warning_html', '')
+                if warning_html:
+                    html += warning_html
+                else:
+                    max_dev = contam.get('max_deviation', 0)
+                    n_anom = len(contam.get('anomalies', []))
+                    html += f"""
+                <div style="background:#fff5f5; border-left:4px solid #c53030;
+                            padding:10px 14px; margin:8px 0; border-radius:0 6px 6px 0;
+                            font-size:12px;">
+                    <div style="font-weight:bold; color:#c53030; margin-bottom:3px;">
+                        ⚠️ OPTIONS VOLUME CONTAMINATION
+                    </div>
+                    <div style="color:#555;">
+                        {n_anom} unusual options event{'s' if n_anom != 1 else ''}
+                        ({max_dev:.1f}x deviation) within ±20 trading days.
+                    </div>
+                    <div style="color:#888; margin-top:4px; font-size:11px;">
+                        Phase 4: insider+options = -11.83% alpha vs +0.99% clean.
+                        Do NOT use insider buying as confirmation — it amplifies negative signal.
+                    </div>
+                </div>
+                    """
+
+            html += """
             </div>
             """
 
@@ -526,6 +594,11 @@ def build_email_html(signals, all_purchases_count, tier2_count, macro_regime=Non
         🟠 Tier 2 (DTC>5 + SI Increasing >10%): +6.73% avg 5d alpha, 69.7% WR (n=142)<br>
         🟡 Tier 3 (DTC>5 only): +4.67% avg 5d alpha, 70.2% WR (n=527)<br>
         ⚪ Tier 4 (Tier2 insider buy, no SI): +3.66% avg 5d alpha, 65.7% WR (n=1803)<br>
+        <br>
+        <b>Phase 4 Options Filter (2021-2026):</b><br>
+        ⚠️ Insider + options spike: -11.83% alpha at 20d, 16.7% WR<br>
+        ⚠️ Call-heavy + insider: -13.86% at 20d, 5.9% WR (NUCLEAR)<br>
+        ✅ Clean insider (no options): +0.99% at 20d<br>
         <i>Past performance does not guarantee future results.</i>
     </div>
     </body></html>
@@ -582,15 +655,19 @@ def log_signals(signals):
             if write_header:
                 f.write("scan_date,ticker,insider_name,insider_title,"
                         "transaction_date,total_value,days_to_cover,"
-                        "si_change_pct,short_pct_float,tier,macro_regime\n")
+                        "si_change_pct,short_pct_float,tier,macro_regime,"
+                        "options_contaminated,options_max_deviation\n")
             scan_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
             for s in signals:
                 macro = s.get('macro_label', 'UNKNOWN')
+                contam = s.get('options_contamination', {})
+                opt_flag = 'YES' if contam.get('contaminated') else 'NO'
+                opt_dev = contam.get('max_deviation', 0)
                 f.write(f"{scan_date},{s['ticker']},{s['insider_name']},"
                         f"{s['insider_title']},{s['transaction_date']},"
                         f"{s['total_value']:.0f},{s['days_to_cover']:.1f},"
                         f"{s['si_change_pct']:.1f},{s['short_pct_float']:.1f},"
-                        f"\"{s['tier']}\",{macro}\n")
+                        f"\"{s['tier']}\",{macro},{opt_flag},{opt_dev:.1f}\n")
         print(f"Logged {len(signals)} signals to {log_path}")
     except Exception as e:
         print(f"Warning: Could not write log: {e}")
@@ -607,8 +684,9 @@ def main():
         return
         
     print("=" * 60)
-    print("CROSS-SIGNAL SCANNER: Insider Buying × Short Interest")
+    print("CROSS-SIGNAL SCANNER: Insider × Short Interest × Options Volume")
     print(f"Run time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"Options contamination filter: {'ENABLED' if OPTIONS_CHECK_AVAILABLE else 'DISABLED'}")
     print("=" * 60)
 
     dry_run = '--dry-run' in sys.argv
@@ -642,20 +720,29 @@ def main():
     # Step 4: Classify signals (with macro context)
     signals = classify_signals(tier2, si_data, macro_regime)
 
+    # Step 4.5: Check options volume contamination (Phase 4)
+    check_signals_contamination(signals)
+
     # Step 5: Display results
     print("\n" + "=" * 60)
-    print(f"RESULTS  |  Macro: {macro_regime['label']}")
+    print(f"RESULTS  |  Macro: {macro_regime['label']}  |  "
+          f"Options filter: {'ON' if OPTIONS_CHECK_AVAILABLE else 'OFF'}")
     print("=" * 60)
     for s in signals:
-        print(f"\n  {s['ticker']} — {s['tier']}")
+        contam = s.get('options_contamination', {})
+        contam_tag = " ⚠️ OPT-CONTAMINATED" if contam.get('contaminated') else ""
+        print(f"\n  {s['ticker']} — {s['tier']}{contam_tag}")
         print(f"    {s['insider_name']} ({s['insider_title']})")
         print(f"    ${s['total_value']:,.0f} on {s['transaction_date']}")
         if not s['si_error']:
             print(f"    DTC: {s['days_to_cover']:.1f} | "
                   f"SI Change: {s['si_change_pct']:+.1f}% | "
                   f"SI% Float: {s['short_pct_float']:.1f}%")
+        if contam.get('contaminated'):
+            print(f"    ⚠️  Options: {contam['max_deviation']:.1f}x deviation, "
+                  f"{len(contam['anomalies'])} events")
 
-    # Step 6: Log signals
+    # Step 6: Log signals (now includes contamination columns)
     log_signals(signals)
 
     # Step 7: Send email
@@ -669,7 +756,10 @@ def main():
 
     # Summary
     confirmed = sum(1 for s in signals if s['tier_num'] <= 2)
-    print(f"\nDone. {len(signals)} Tier2 signals, {confirmed} with SI confirmation.")
+    contaminated_n = sum(1 for s in signals
+                         if s.get('options_contamination', {}).get('contaminated'))
+    print(f"\nDone. {len(signals)} Tier2 signals, {confirmed} with SI confirmation, "
+          f"{contaminated_n} options-contaminated.")
 
 
 if __name__ == '__main__':

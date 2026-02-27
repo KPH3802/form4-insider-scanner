@@ -37,6 +37,18 @@ The highest-conviction signal combines insider buying clusters with short squeez
 | **Tier 2 + DTC>5 + SI increasing >10%** | **+6.73%** | **69.7%** | n=142, p<0.0001 |
 | Tier 2 + DTC>5 (no SI filter) | +4.67% | 70.2% | n=527, p<0.0001 |
 
+### Options Volume Contamination Filter (Phase 4)
+
+When insider buying coincides with unusual options volume (Vol/OI ≥ 7x), the insider signal flips negative. The scanner checks for options spikes within ±20 trading days and flags contaminated signals.
+
+| Condition | 20d Alpha | Win Rate | Sample |
+|-----------|----------|----------|--------|
+| Insider + options spike | **-11.83%** | 16.7% | p=0.0017 |
+| Call-heavy (C/P ≥ 1.25) + insider | **-13.86%** | 5.9% | p=0.006 |
+| Clean insider (no options spike) | **+0.99%** | — | p=0.019 |
+
+Contaminated clusters are flagged with warning banners in email alerts. This is a filter, not a strategy — contamination is rare (1–3% of events) but catastrophic when present.
+
 ---
 
 ## Architecture
@@ -49,9 +61,10 @@ main.py                    # Orchestrator — daily pipeline
 ├── analyzer.py            # Cluster detection + sell signal algorithms
 ├── signal_scorer.py       # Scores clusters against backtested tier filters
 ├── email_reporter.py      # HTML email alerts + daily status reports
+├── options_volume_check.py # Phase 4 options contamination filter
 └── config.py              # Credentials and thresholds (not committed)
 
-cross_signal_scanner.py    # Insider buying × short interest enrichment
+cross_signal_scanner.py    # Insider × short interest × options volume enrichment
 combo_analysis.py          # Multi-factor combination analysis
 insider_cluster_backtest.py # Historical backtesting framework
 download_sec_form4.py      # Bulk SEC EDGAR data downloader (quarterly TSV files)
@@ -68,8 +81,9 @@ check_roles.py             # Officer/Director role analysis
 3. **Store** — Inserts into SQLite with deduplication by accession number
 4. **Detect** — Runs cluster detection (multiple insiders, same company, 14-day window) and sell signal detection
 5. **Score** — Ranks clusters against backtested tier definitions
-6. **Enrich** — Cross-references with short interest data for highest-conviction signals
-7. **Alert** — Sends prioritized HTML email with tier classification and context
+6. **Filter** — Checks for concurrent options volume spikes that kill insider alpha (Phase 4)
+7. **Enrich** — Cross-references with short interest data for highest-conviction signals
+8. **Alert** — Sends prioritized HTML email with tier classification, contamination warnings, and context
 
 ---
 
