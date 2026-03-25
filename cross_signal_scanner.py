@@ -703,10 +703,7 @@ def main():
     # Step 2: Filter for Tier2 (C-Suite + $500K+)
     tier2 = filter_tier2(purchases)
     if not tier2:
-        print("No Tier2 signals. Sending status email.")
-        if not dry_run:
-            subject, html, priority = build_email_html([], len(purchases), 0)
-            send_email(subject, html, priority)
+        print("No Tier2 signals — no email sent.")
         return
 
     # Step 3: Fetch short interest data for Tier2 tickers

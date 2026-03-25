@@ -327,12 +327,18 @@ def main():
         print("\n" + "=" * 40)
         sells, sell_alerts_sent = analyze_sells_and_alert(dry_run=dry_run)
     
-    # Send daily status (always, unless fetch-only or analyze-only)
+    # Send daily status only if something went wrong (no filings processed)
+    # Signal emails (buy clusters, sell alerts) are sent above when signals fire.
+    # On a clean no-signal night, no email is sent — inbox stays quiet.
     if not fetch_only and not analyze_only:
-        print("\n" + "=" * 40)
-        print("Sending daily status email...")
-        send_status_report(filings_processed, transactions_added, clusters,
-                           sells, dry_run=dry_run)
+        if filings_processed == 0 and transactions_added == 0:
+            print("\n" + "=" * 40)
+            print("Sending status email (no filings processed — possible error)...")
+            send_status_report(filings_processed, transactions_added, clusters,
+                               sells, dry_run=dry_run)
+        else:
+            print("\n" + "=" * 40)
+            print("Clean run — status email suppressed.")
     
     print("\n" + "=" * 40)
     print("Scan complete!")
