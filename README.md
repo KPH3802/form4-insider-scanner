@@ -1,8 +1,10 @@
 # Form 4 Insider Scanner
 
-**Automated SEC Form 4 filing scanner that detects insider buying clusters, sell signals, and cross-signal patterns (insider activity × short interest). Backtested against 432,625 trades across 5,717 tickers from 2020–2025.**
+**Automated SEC Form 4 filing scanner that detects insider buying clusters, sell signals, and cross-signal patterns (insider activity x short interest). Backtested against 432,625 trades across 5,717 tickers from 2020-2025.**
 
 Corporate insiders — officers, directors, and 10%+ shareholders — are required to report stock transactions to the SEC via Form 4 within two business days. This tool ingests those filings in real time, identifies statistically significant patterns, and delivers prioritized alerts via email.
+
+**Live Deployment:** Buy cluster signals (Tier 1/2) are deployed in an automated equity trading system running on Interactive Brokers, executing positions at next-morning open.
 
 ---
 
@@ -14,9 +16,9 @@ The system detects when multiple insiders at the same company buy stock within a
 
 | Tier | Filter | 5d Alpha | Win Rate | Sample |
 |------|--------|----------|----------|--------|
-| **Tier 1 — Conviction Buy** | C-Suite + total value ≥ $5M | +4.08% | 57.4% | n=230 |
-| **Tier 2 — Strong Signal** | C-Suite + total value ≥ $500K | +1.81–2.43% | 54–57% | n=423–742 |
-| **Tier 3 — Mean Reversion** | C-Suite + ≥ $500K + stock beaten down >10% | +13.44% (60d) | 55.3% | n=320 |
+| **Tier 1 — Conviction Buy** | C-Suite + total value >= $5M | +4.08% | 57.4% | n=230 |
+| **Tier 2 — Strong Signal** | C-Suite + total value >= $500K | +1.81-2.43% | 54-57% | n=423-742 |
+| **Tier 3 — Mean Reversion** | C-Suite + >= $500K + stock beaten down >10% | +13.44% (60d) | 55.3% | n=320 |
 | Watch | Doesn't meet tier criteria | Informational | — | — |
 | Avoid | No C-Suite + small dollar | Negative alpha | — | — |
 
@@ -24,11 +26,11 @@ The system detects when multiple insiders at the same company buy stock within a
 
 | Tier | Filter | 5d Alpha | Significance |
 |------|--------|----------|-------------|
-| **Sell Tier 1** | Officer+Director dual role, $250K–$5M | -2.54% | p<0.0001 |
-| **Sell Tier 2** | Officer OR Director, $250K–$5M | -0.50 to -0.86% | p<0.0001 |
-| Sell Watch | Other significant sells ($50K–$250K or $5M+) | -0.85% | Likely 10b5-1 |
+| **Sell Tier 1** | Officer+Director dual role, $250K-$5M | -2.54% | p<0.0001 |
+| **Sell Tier 2** | Officer OR Director, $250K-$5M | -0.50 to -0.86% | p<0.0001 |
+| Sell Watch | Other significant sells ($50K-$250K or $5M+) | -0.85% | Likely 10b5-1 |
 
-### Cross-Signal: Insider Buying × Short Interest
+### Cross-Signal: Insider Buying x Short Interest
 
 The highest-conviction signal combines insider buying clusters with short squeeze conditions:
 
@@ -39,15 +41,15 @@ The highest-conviction signal combines insider buying clusters with short squeez
 
 ### Options Volume Contamination Filter (Phase 4)
 
-When insider buying coincides with unusual options volume (Vol/OI ≥ 7x), the insider signal flips negative. The scanner checks for options spikes within ±20 trading days and flags contaminated signals.
+When insider buying coincides with unusual options volume (Vol/OI >= 7x), the insider signal flips negative. The scanner checks for options spikes within +/-20 trading days and flags contaminated signals.
 
 | Condition | 20d Alpha | Win Rate | Sample |
 |-----------|----------|----------|--------|
 | Insider + options spike | **-11.83%** | 16.7% | p=0.0017 |
-| Call-heavy (C/P ≥ 1.25) + insider | **-13.86%** | 5.9% | p=0.006 |
+| Call-heavy (C/P >= 1.25) + insider | **-13.86%** | 5.9% | p=0.006 |
 | Clean insider (no options spike) | **+0.99%** | — | p=0.019 |
 
-Contaminated clusters are flagged with warning banners in email alerts. This is a filter, not a strategy — contamination is rare (1–3% of events) but catastrophic when present.
+Contaminated clusters are flagged with warning banners in email alerts. This is a filter, not a strategy — contamination is rare (1-3% of events) but catastrophic when present.
 
 ---
 
@@ -64,19 +66,17 @@ main.py                    # Orchestrator — daily pipeline
 ├── options_volume_check.py # Phase 4 options contamination filter
 └── config.py              # Credentials and thresholds (not committed)
 
-cross_signal_scanner.py    # Insider × short interest × options volume enrichment
+cross_signal_scanner.py    # Insider x short interest x options volume enrichment
 combo_analysis.py          # Multi-factor combination analysis
 insider_cluster_backtest.py # Historical backtesting framework
 download_sec_form4.py      # Bulk SEC EDGAR data downloader (quarterly TSV files)
-check_relationship.py      # Insider relationship type analysis
-check_roles.py             # Officer/Director role analysis
 ```
 
 ---
 
 ## Data Pipeline
 
-1. **Fetch** — Pulls the latest 100 Form 4 filings from SEC EDGAR's RSS feed every run
+1. **Fetch** — Pulls the latest 100 Form 4 filings from SEC EDGAR RSS feed every run
 2. **Parse** — Extracts issuer, insider identity, relationship, transaction type, shares, price, and value from XML
 3. **Store** — Inserts into SQLite with deduplication by accession number
 4. **Detect** — Runs cluster detection (multiple insiders, same company, 14-day window) and sell signal detection
@@ -90,69 +90,43 @@ check_roles.py             # Officer/Director role analysis
 ## Setup
 
 ```bash
-# Clone the repo
 git clone https://github.com/KPH3802/form4-insider-scanner.git
 cd form4-insider-scanner
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Configure credentials
 cp config_example.py config.py
-# Edit config.py with your email credentials
-
-# Run the scanner
 python main.py
-
-# Run with options
-python main.py --dry-run        # Test without sending emails
-python main.py --fetch-only     # Only fetch, no analysis
-python main.py --analyze-only   # Only analyze existing data
-
-# Run the cross-signal scanner (after main scanner)
+python main.py --dry-run
+python main.py --fetch-only
+python main.py --analyze-only
 python cross_signal_scanner.py
 ```
 
 ### Requirements
 - Python 3.8+
 - SEC EDGAR access (free, requires user agent with contact email per SEC policy)
-- Gmail account with [App Password](https://myaccount.google.com/apppasswords) for alerts
-
-### Bulk Historical Data
-
-The `download_sec_form4.py` script downloads quarterly Form 3/4/5 bulk data from SEC EDGAR for backtesting. Data covers 2020 Q1 through present.
+- Gmail account with App Password for alerts
 
 ---
 
 ## Backtesting
 
-The system was backtested against SEC bulk data:
-- **432,625 insider trades** across **5,717 tickers** (2020–2025)
+- **432,625 insider trades** across **5,717 tickers** (2020-2025)
 - **5,774 cluster signals** evaluated across 5d, 10d, 20d, 40d, and 60d holding windows
 - Alpha calculated against SPY benchmark over matching periods
 - Statistical significance tested via t-test (p-values reported)
 
-Run your own backtest:
 ```bash
 python insider_cluster_backtest.py
 ```
 
 ---
 
-## Disclaimer
-
-This tool is for **educational and research purposes only**. SEC Form 4 data is public information. This project does not constitute financial advice. Backtested results reflect historical data and do not guarantee future performance. Always do your own research.
-
----
-
 ## Related Projects
 
-This is part of a suite of quantitative research tools:
-
-- [congress-trade-tracker](https://github.com/KPH3802/congress-trade-tracker) — Automated congressional stock trade tracking with 10 detection algorithms and 46K+ backtested signals
+- [congress-trade-tracker](https://github.com/KPH3802/congress-trade-tracker) — Congressional stock trade monitoring with 10 detection algorithms
 - [options-volume-scanner](https://github.com/KPH3802/options-volume-scanner) — Unusual options volume detection across S&P 500 stocks
-- [volatility-scanner](https://github.com/KPH3802/volatility-scanner) — IV rank, HV patterns, and term structure tracking across 500+ instruments
-- [natural-gas-weather-signals](https://github.com/KPH3802/natural-gas-weather-signals) — Weather-driven natural gas storage modeling and trading signals
+- [volatility-scanner](https://github.com/KPH3802/volatility-scanner) — IV rank, HV patterns, and term structure tracking
+- [natural-gas-weather-signals](https://github.com/KPH3802/natural-gas-weather-signals) — Weather-driven natural gas storage research
 - [trading-utilities](https://github.com/KPH3802/trading-utilities) — Shared data pipeline: 13F filings, FRED data, price history, dividends, earnings, short interest
 
 ---
@@ -161,6 +135,12 @@ This is part of a suite of quantitative research tools:
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-kevin--heaney-blue?logo=linkedin)](https://www.linkedin.com/in/kevin-heaney/)
 [![Medium](https://img.shields.io/badge/Medium-@KPH3802-black?logo=medium)](https://medium.com/@KPH3802)
+
+---
+
+## Disclaimer
+
+This tool is for **educational and research purposes only**. SEC Form 4 data is public information. This project does not constitute financial advice. Backtested results reflect historical data and do not guarantee future performance.
 
 ---
 
